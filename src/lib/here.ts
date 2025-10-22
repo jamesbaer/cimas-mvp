@@ -66,6 +66,12 @@ export async function sequenceWaypoints(
 ): Promise<SequencedWaypoint[]> {
   if (waypoints.length === 0) return [];
   
+  // WPS API has a limit (~100-120 waypoints). For large clusters, skip WPS and use cluster order
+  if (waypoints.length > 50) {
+    console.log(`[WPS] Skipping WPS for ${waypoints.length} waypoints (too many). Using cluster order.`);
+    return waypoints.map((wp, idx) => ({ ...wp, sequenceIndex: idx }));
+  }
+  
   const baseUrl = 'https://wps.hereapi.com/v8/findsequence2';
   const params = new URLSearchParams();
   
@@ -95,6 +101,8 @@ export async function sequenceWaypoints(
   params.append('apiKey', apiKey);
   
   const url = `${baseUrl}?${params.toString()}`;
+  console.log('[WPS] Request URL params:', params.toString().substring(0, 300));
+  console.log('[WPS] Number of waypoints in request:', waypoints.length);
   
   try {
     const response = await fetch(url);
@@ -105,12 +113,17 @@ export async function sequenceWaypoints(
     }
     
     const data = await response.json();
+    console.log('[WPS] Response data:', JSON.stringify(data).substring(0, 500));
+    
     const sequence = data.results?.[0]?.waypoints || [];
+    console.log('[WPS] Found', sequence.length, 'waypoints in sequence');
+    
     const sequenced: SequencedWaypoint[] = [];
     
     let sequenceIndex = 0;
     for (let i = 0; i < sequence.length; i++) {
       const seqWp = sequence[i];
+      console.log(`[WPS] Waypoint ${i}: id=${seqWp.id}`);
       // Skip start, end, and planta - they're not customer stops
       if (seqWp.id === 's' || seqWp.id === 'e' || seqWp.id === 'planta') continue;
       
@@ -187,13 +200,16 @@ export async function getTruckRoute(
   try {
     const response = await fetch(url);
     if (!response.ok) {
-      throw new Error(`Truck routing failed: ${response.statusText}`);
+      const errorText = await response.text();
+      console.error('[getTruckRoute] Routing API error:', response.status, errorText);
+      throw new Error(`Truck routing failed: ${response.status}`);
     }
     
     const data = await response.json();
     const route = data.routes?.[0];
     
     if (!route) {
+      console.error('[getTruckRoute] No route in response:', JSON.stringify(data).substring(0, 500));
       throw new Error('No route found in response');
     }
     
@@ -223,7 +239,7 @@ export async function getTruckRoute(
       rawResponse: data, // Store raw API response for rendering
     };
   } catch (error) {
-    console.error('Truck routing error:', error);
+    console.error('[getTruckRoute] Error:', error instanceof Error ? error.message : error);
     return null;
   }
 }
@@ -242,21 +258,33 @@ export async function processAllRoutes(
 ): Promise<RoutePolyline[]> {
   const routes: RoutePolyline[] = [];
   
+  console.log(`[processAllRoutes] Starting with ${numClusters} clusters, ${clusteredWaypoints.length} total waypoints`);
+  
   for (let cluster = 0; cluster < numClusters; cluster++) {
     const clusterWaypoints = clusteredWaypoints.filter(w => w.cluster === cluster);
     
-    if (clusterWaypoints.length === 0) continue;
+    if (clusterWaypoints.length === 0) {
+      console.log(`[processAllRoutes] Cluster ${cluster} is empty, skipping`);
+      continue;
+    }
     
     console.log(`Processing route ${cluster + 1}/${numClusters} with ${clusterWaypoints.length} stops...`);
     
     const sequenced = await sequenceWaypoints(clusterWaypoints, cocheraLat, cocheraLon, plantaLat, plantaLon, apiKey);
+    console.log(`[processAllRoutes] Sequenced ${sequenced.length} waypoints for cluster ${cluster}`);
+    
     const route = await getTruckRoute(sequenced, cocheraLat, cocheraLon, plantaLat, plantaLon, apiKey);
+    console.log(`[processAllRoutes] getTruckRoute returned:`, route ? 'SUCCESS' : 'NULL');
     
     if (route) {
       const name = generateRouteName(cluster, clusterWaypoints, cocheraLat, cocheraLon);
+      console.log(`[processAllRoutes] Adding route: ${name}`);
       routes.push({ ...route, name });
+    } else {
+      console.error(`[processAllRoutes] Route ${cluster} failed - getTruckRoute returned null`);
     }
   }
   
+  console.log(`[processAllRoutes] Returning ${routes.length} routes`);
   return routes;
 }
