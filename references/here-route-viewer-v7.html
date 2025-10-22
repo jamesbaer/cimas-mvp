@@ -1,0 +1,515 @@
+<!--
+MVP ROUTE CREATOR (HTML FRONTEND)
+- Upload CSV of depot/start, end, and intermediate stops
+- Optional truck specs (max stops/time, capacity, dimensions)
+- Groups by treatment, partitions to multiple routes if needed
+- Calls backend proxy (/wps, /route) to hit HERE Waypoint Sequencing + Routing Truck APIs
+- Renders results on Leaflet map (no map API key needed)
+
+FILES IN THIS DOCUMENT
+1) index.html  (the app UI + map)
+2) server.js   (minimal Express proxy; keeps HERE API key secret)
+3) .env        (example env vars)
+4) README notes (schema + how splitting works)
+-->
+
+<!-- =============================
+= 1) index.html
+============================== -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MVP Route Creator</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    :root { --border:#e5e7eb; --muted:#6b7280; }
+    body { margin:0; font-family: system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; }
+    header { padding: 12px 16px; border-bottom: 1px solid var(--border); display:flex; gap:12px; align-items:center; }
+    header h1 { font-size: 16px; margin: 0; font-weight: 700; }
+    #wrap { display: grid; grid-template-columns: 480px 1fr; height: calc(100vh - 57px); }
+    #left { border-right: 1px solid var(--border); display:flex; flex-direction:column; min-width: 360px; }
+    #controls { padding: 12px; display: grid; gap: 10px; }
+    label { font-size: 12px; color: var(--muted); }
+    input[type="file"], input[type="text"], input[type="number"], select { font-size: 12px; padding:6px; border:1px solid var(--border); border-radius:8px; width:100%; }
+    fieldset { border:1px solid var(--border); border-radius:10px; padding:10px; }
+    legend { font-size:12px; color:#374151; padding:0 6px; }
+    button { padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; background: #fafafa; cursor: pointer; }
+    button:hover { background: #f0f0f0; }
+    .row { display:grid; gap:6px; }
+    #log, #violations { padding: 12px; border-top:1px solid var(--border); border-bottom:1px solid var(--border); height: 120px; overflow:auto; font-size: 12px; }
+    #map { width: 100%; height: calc(100vh - 57px); }
+    .pill { display:inline-block; padding:2px 6px; border-radius:999px; background:#eef; color:#114; font-size:11px; border:1px solid #bbf; margin-right:6px; }
+    .warn { background:#fff6e6; border-color:#f7c97f; color:#7a4b00; }
+    .err { background:#fee; border-color:#f8a6a6; color:#7a0b0b; }
+    .ok { background:#e8f7ee; border-color:#98e0b5; color:#0b5a2a; }
+    .small { color: var(--muted); font-size: 12px; }
+    .legend { padding: 8px 12px; font-size: 12px; color:#6b7280; }
+    .num-icon { width: 22px; height: 22px; background: #1f2937; color:#fff; border-radius: 50%; display:flex; align-items:center; justify-content:center; font-size:12px; border:2px solid #fff; box-shadow: 0 0 0 1px rgba(0,0,0,.2); }
+    .grid2 { display:grid; grid-template-columns: 1fr 1fr; gap:8px; }
+    .grid3 { display:grid; grid-template-columns: 1fr 1fr 1fr; gap:8px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>MVP Route Creator</h1>
+    <span class="small">CSV → Filter by waste → Cluster → Sequence → Truck route → Map</span>
+  </header>
+  <div id="wrap">
+    <div id="left">
+      <div id="controls">
+        <div class="row">
+          <label for="csv">Upload CSV (required)</label>
+          <input id="csv" type="file" accept=".csv,text/csv" />
+          <details>
+            <summary class="small">Expected columns (your sheet)</summary>
+            <div class="small">
+              <ul>
+                <li>Column A: <b>Latitude</b></li>
+                <li>Column B: <b>Longitude</b></li>
+                <li>Column C: <b>Envase Final</b> ("Si" or empty)</li>
+                <li>Column D: <b>Resto Final</b></li>
+                <li>Column E: <b>Papel Final</b></li>
+                <li>Column F: <b>Reutilizables Final</b></li>
+                <li>Column G: <b>Vidrio Final</b></li>
+                <li>Column H: <b>Aceite Final</b></li>
+              </ul>
+              <div>We’ll filter rows to only those with <b>"Si"</b> in the chosen column.</div>
+            </div>
+          </details>
+        </div>
+
+        <fieldset>
+          <legend>Waste type filter</legend>
+          <div class="grid2">
+            <div>
+              <label>Waste type</label>
+              <select id="wasteType">
+                <option value="Envase Final">Envase</option>
+                <option value="Resto Final">Resto</option>
+                <option value="Papel Final">Papel</option>
+                <option value="Reutilizables Final">Reutilizables</option>
+                <option value="Vidrio Final">Vidrio</option>
+                <option value="Aceite Final">Aceite</option>
+              </select>
+            </div>
+            <div>
+              <label>Number of routes (optional)</label>
+              <input id="manualK" type="number" min="1" step="1" placeholder="auto" />
+            </div>
+          </div>
+        </fieldset>
+
+        <fieldset>
+          <legend>Depots</legend>
+          <div class="grid2">
+            <div>
+              <label>Start depot lat</label>
+              <input id="startLat" type="number" step="0.000001" placeholder="e.g., 43.123456" />
+            </div>
+            <div>
+              <label>Start depot lon</label>
+              <input id="startLon" type="number" step="0.000001" placeholder="e.g., -2.654321" />
+            </div>
+          </div>
+          <div class="grid2">
+            <div>
+              <label>End depot lat (optional)</label>
+              <input id="endLat" type="number" step="0.000001" placeholder="defaults to start" />
+            </div>
+            <div>
+              <label>End depot lon (optional)</label>
+              <input id="endLon" type="number" step="0.000001" placeholder="defaults to start" />
+            </div>
+          </div>
+        </fieldset>
+
+        <fieldset>
+          <legend>Constraints (optional)</legend>
+          <div class="grid3">
+            <div>
+              <label>Max stops per route</label>
+              <input id="maxStops" type="number" min="2" step="1" placeholder="e.g., 30" />
+            </div>
+            <div>
+              <label>Max minutes per route</label>
+              <input id="maxMinutes" type="number" min="0" step="1" placeholder="e.g., 480" />
+            </div>
+            <div>
+              <label>Capacity by weight (kg)</label>
+              <input id="capWeight" type="number" min="0" step="1" placeholder="optional" />
+            </div>
+          </div>
+        </fieldset>
+
+        <fieldset>
+          <legend>Truck specs (optional)</legend>
+          <div class="grid2">
+            <div>
+              <label>Height (m)</label>
+              <input id="truckHeight" type="number" min="0" step="0.1" />
+            </div>
+            <div>
+              <label>Width (m)</label>
+              <input id="truckWidth" type="number" min="0" step="0.1" />
+            </div>
+            <div>
+              <label>Length (m)</label>
+              <input id="truckLength" type="number" min="0" step="0.1" />
+            </div>
+            <div>
+              <label>Gross weight (kg)</label>
+              <input id="truckWeight" type="number" min="0" step="10" />
+            </div>
+          </div>
+        </fieldset>
+
+        <div class="row" style="display:flex; gap:8px; flex-wrap:wrap;">
+          <button id="run">Create routes</button>
+          <button id="clear">Clear</button>
+        </div>
+
+        <div class="legend">
+          <div><span class="pill ok">Safe API usage</span> Frontend → <b>our proxy</b> → HERE (key stays server-side)</div>
+          <div><span class="pill">WPS</span> Waypoint Sequencing (orders stops), per cluster</div>
+          <div><span class="pill">Routing</span> Truck routing (polyline), per cluster</div>
+          <div><span class="pill">K‑means</span> Geographic pre‑split into K routes</div>
+        </div>
+      </div>
+      <div id="log"><div><span class="pill">Log</span> Ready.</div></div>
+      <div id="violations"><div><span class="pill">Notices</span> None.</div></div>
+    </div>
+    <div id="map"></div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+  <script>
+    // Flex polyline decoder
+    (function(){
+      const CHARSET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+      function decodeChar(c){ const i = CHARSET.indexOf(c); if(i===-1) throw new Error("Invalid char:"+c); return i; }
+      function toSigned(v){ return (v & 1) ? (~v >> 1) : (v >> 1); }
+      window.decodeFlexPolyline = function(encoded){
+        let pos=0; function next(){ let r=0,s=0,v; do { v=decodeChar(encoded[pos++]); r |= (v & 0x1f) << s; s += 5; } while (v & 0x20); return r; }
+        const ver = next(); if (ver!==1) throw new Error("Unsupported version:"+ver);
+        const header = next(); const prec = header & 15; const third = (header>>4)&7; const tprec = (header>>8)&15;
+        const f2d = Math.pow(10, prec); const f3d = Math.pow(10, tprec);
+        let lat=0,lng=0,z=0; const out=[];
+        while(pos<encoded.length){ lat += ((toSigned(next()))); lng += ((toSigned(next())));
+          const p=[lat/f2d, lng/f2d]; if(third){ z += toSigned(next()); p.push(z/f3d);} out.push(p);} return out; };
+    })();
+
+    // Map init
+    const map = L.map('map');
+    const base = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '&copy; OpenStreetMap contributors' }).addTo(map);
+    map.setView([42.85, -2.66], 11);
+
+    const logDiv = document.getElementById('log');
+    const violDiv = document.getElementById('violations');
+    function log(msg, cls){ const line=document.createElement('div'); line.innerHTML=`<span class="pill ${cls||''}">${cls==='err'?'Error':'Info'}</span> ${msg}`; logDiv.appendChild(line); logDiv.scrollTop=logDiv.scrollHeight; }
+    function clearPanels(){ logDiv.innerHTML='<div><span class="pill">Log</span> Cleared.</div>'; violDiv.innerHTML='<div><span class="pill">Notices</span> None.</div>'; }
+    function makeNumberIcon(n){ return L.divIcon({ className:'num-icon', html:String(n), iconSize:[22,22], iconAnchor:[11,11]}); }
+
+    // CSV → rows (header aware)
+    function parseCSV(file){
+      return new Promise((resolve,reject)=>{
+        Papa.parse(file, { header:true, skipEmptyLines:true, complete: (res)=> resolve(res.data), error: reject });
+      });
+    }
+
+    // Choose the correct column names or A/B fallback
+    function getLatLon(row){
+      let lat = row['Latitude'] ?? row['Lat'] ?? row['lat'] ?? row['A'];
+      let lon = row['Longitude'] ?? row['Lon'] ?? row['lng'] ?? row['long'] ?? row['B'];
+      return { lat: Number(lat), lon: Number(lon) };
+    }
+
+    // K-means clustering around geographic centers (Haversine distance)
+    function hav(a,b){
+      const toRad = d=> d*Math.PI/180;
+      const R=6371; // km
+      const dLat=toRad(b.lat-a.lat), dLon=toRad(b.lon-a.lon);
+      const s1=Math.sin(dLat/2), s2=Math.sin(dLon/2);
+      const h=s1*s1 + Math.cos(toRad(a.lat))*Math.cos(toRad(b.lat))*s2*s2;
+      return 2*R*Math.asin(Math.min(1,Math.sqrt(h)));
+    }
+
+    function kmeans(points, k, iters=12){
+      if (k<=1 || points.length<=k) return points.map((p,i)=>({cluster:i, ...p}));
+      // init: pick k random points
+      const cents = [];
+      const taken = new Set();
+      while(cents.length<k){ const idx=Math.floor(Math.random()*points.length); if(!taken.has(idx)){ taken.add(idx); cents.push({ lat:points[idx].lat, lon:points[idx].lon }); } }
+      let assign = new Array(points.length).fill(0);
+      for(let t=0;t<iters;t++){
+        // assign
+        for(let i=0;i<points.length;i++){
+          let best=0, bd=Infinity;
+          for(let c=0;c<k;c++){ const d=hav(points[i], cents[c]); if(d<bd){ bd=d; best=c; } }
+          assign[i]=best;
+        }
+        // recompute
+        const sums = Array.from({length:k},()=>({lat:0,lon:0,n:0}));
+        for(let i=0;i<points.length;i++){ const c=assign[i]; sums[c].lat+=points[i].lat; sums[c].lon+=points[i].lon; sums[c].n++; }
+        for(let c=0;c<k;c++){ if(sums[c].n>0){ cents[c].lat=sums[c].lat/sums[c].n; cents[c].lon=sums[c].lon/sums[c].n; } }
+      }
+      return points.map((p,i)=>({ cluster:assign[i], ...p }));
+    }
+
+    // Proxy POST
+    async function postJSON(path, payload){
+      const res = await fetch(path, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+      if(!res.ok) throw new Error(`${path} ${res.status}`);
+      return res.json();
+    }
+
+    async function createRoutes(){
+      clearPanels();
+      const file = document.getElementById('csv').files[0];
+      if(!file){ alert('Upload CSV first'); return; }
+      const wasteCol = document.getElementById('wasteType').value;
+      const manualK = Number(document.getElementById('manualK').value||0);
+
+      const startLat = Number(document.getElementById('startLat').value);
+      const startLon = Number(document.getElementById('startLon').value);
+      if(!startLat || !startLon){ alert('Provide start depot lat/lon'); return; }
+      const endLat = Number(document.getElementById('endLat').value) || startLat;
+      const endLon = Number(document.getElementById('endLon').value) || startLon;
+
+      const maxStops = Number(document.getElementById('maxStops').value||0) || undefined;
+      const maxMinutes = Number(document.getElementById('maxMinutes').value||0) || undefined;
+      const capWeight = Number(document.getElementById('capWeight').value||0) || undefined;
+      const truckDims = {
+        height: Number(document.getElementById('truckHeight').value||0) || undefined,
+        width:  Number(document.getElementById('truckWidth').value||0) || undefined,
+        length: Number(document.getElementById('truckLength').value||0) || undefined,
+        weight: Number(document.getElementById('truckWeight').value||0) || undefined
+      };
+
+      log('Parsing CSV...');
+      const rows = await parseCSV(file);
+
+      // Filter by selected waste type == 'Si'
+      const filtered = rows.filter(r=> String(r[wasteCol]||'').trim().toLowerCase()==='si')
+                           .map((r,i)=> ({ id: r.id || String(i+1), ...getLatLon(r) }));
+      if(!filtered.length){ log(`No rows with "Si" in ${wasteCol}`, 'err'); return; }
+
+      // Decide number of routes (clusters)
+      let k = manualK && manualK>0 ? manualK : 1;
+      if(maxStops){ k = Math.max(k, Math.ceil(filtered.length / maxStops)); }
+      k = Math.max(1, k);
+      log(`Clustering ${filtered.length} stops into K=${k} geographic buckets...`);
+      const clustered = kmeans(filtered, k);
+
+      // Prepare map
+      map.eachLayer(l=>{ if(l!==base) map.removeLayer(l); });
+      const group = L.featureGroup().addTo(map);
+
+      let totalRoutes = 0;
+
+      for(let ci=0; ci<k; ci++){
+        const clusterStops = clustered.filter(p=> p.cluster===ci);
+        if(clusterStops.length===0) continue;
+
+        // WPS: start → stops → end
+        const waypoints = [
+          { id: `start-${ci}`, lat:startLat, lng:startLon, is_depot:true },
+          ...clusterStops.map(s=> ({ id:s.id, lat:s.lat, lng:s.lon })),
+          { id: `end-${ci}`,   lat:endLat,   lng:endLon,   is_depot:true }
+        ];
+        log(`Sequencing route ${ci+1}/${k} with ${clusterStops.length} stops...`);
+        const wps = await postJSON('/wps', { waypoints, objective:'minimize_travel_time' });
+        const ordered = wps.results?.[0]?.waypoints?.slice()?.sort((a,b)=> (a.sequence||0)-(b.sequence||0)) || [];
+        if(!ordered.length){ log('WPS returned no order', 'err'); continue; }
+
+        // Truck routing
+        const routerReq = {
+          origin: { lat: ordered[0].lat, lng: ordered[0].lng },
+          destination: { lat: ordered[ordered.length-1].lat, lng: ordered[ordered.length-1].lng },
+          vias: ordered.slice(1, -1).map(o=> ({ lat:o.lat, lng:o.lng })),
+          truck: truckDims
+        };
+        log(`Routing ${ci+1}/${k}...`);
+        const routeRes = await postJSON('/route', routerReq);
+
+        // Draw
+        const sections = routeRes.routes?.[0]?.sections || [];
+        let drew=false; let markerIdx=0; const fallback=[];
+        sections.forEach((sec)=>{
+          if(sec.polyline){
+            try { const coords=window.decodeFlexPolyline(sec.polyline); L.polyline(coords,{weight:4}).addTo(group); drew=true; }
+            catch(e){ log('Polyline decode failed: '+e.message,'err'); }
+          }
+          if (markerIdx===0 && sec.departure?.place?.location){
+            const ll=[sec.departure.place.location.lat, sec.departure.place.location.lng];
+            L.marker(ll,{icon:makeNumberIcon(markerIdx)}).addTo(group).bindPopup(`<b>Start</b>`); fallback.push(ll); markerIdx++;
+          }
+          if (sec.arrival?.place?.location){
+            const ll=[sec.arrival.place.location.lat, sec.arrival.place.location.lng];
+            L.marker(ll,{icon:makeNumberIcon(markerIdx)}).addTo(group).bindPopup(`<b>Stop ${markerIdx}</b>`); fallback.push(ll); markerIdx++;
+          }
+          if(Array.isArray(sec.notices)){
+            sec.notices.forEach(n=>{ const row=document.createElement('div'); row.innerHTML=`<span class='pill warn'>${n.title||n.code||'notice'}</span>`; violDiv.appendChild(row); });
+          }
+        });
+        if(!drew && fallback.length>1){ L.polyline(fallback,{weight:2, dashArray:'4,6'}).addTo(group); drew=true; }
+
+        totalRoutes++;
+      }
+
+      if(totalRoutes>0){ try{ map.fitBounds(group.getBounds(),{padding:[24,24]}); } catch{} }
+      log(`Done. Rendered ${totalRoutes} route(s).`);
+    }
+
+    document.getElementById('run').addEventListener('click', createRoutes);
+    document.getElementById('clear').addEventListener('click', ()=>{
+      document.getElementById('csv').value='';
+      map.eachLayer(l=>{ if(l!==base) map.removeLayer(l); });
+      clearPanels();
+    });
+  </script>
+</body>
+</html>
+
+
+<!-- =============================
+= 2) server.js (Express proxy)
+============================== -->
+<script type="text/plain" data-filename="server.js">
+import express from 'express';
+import fetch from 'node-fetch';
+import dotenv from 'dotenv';
+dotenv.config();
+
+const app = express();
+app.use(express.json({ limit: '2mb' }));
+
+const HERE_API_KEY = process.env.HERE_API_KEY;
+if(!HERE_API_KEY){
+  console.error('Missing HERE_API_KEY in environment');
+  process.exit(1);
+}
+
+// Waypoint Sequencing proxy
+// Expected payload: { waypoints: [{id,lat,lng,is_depot?}, ...], objective }
+app.post('/wps', async (req, res) => {
+  try {
+    const { waypoints = [], objective = 'minimize_travel_time' } = req.body || {};
+    // Build querystring for HERE WPS v8 (findsequence2)
+    // Each waypoint must be w{i}=id;lat,lon
+    const params = new URLSearchParams({ apiKey: HERE_API_KEY, mode: 'balanced;truck' });
+    // origin/destination: use first and last provided waypoints marked is_depot
+    const start = waypoints.find(w => w.is_depot) || waypoints[0];
+    const end   = [...waypoints].reverse().find(w => w.is_depot) || waypoints[waypoints.length-1];
+
+    const stops = waypoints.filter(w => !(w === start || w === end));
+
+    let idx = 0;
+    params.set(`start`, `${start.id||'start'};${start.lat},${start.lng}`);
+    params.set(`end`, `${end.id||'end'};${end.lat},${end.lng}`);
+    stops.forEach((w) => { params.append(`w${idx++}`, `${w.id};${w.lat},${w.lng}`); });
+    params.set('improveFor', objective === 'minimize_travel_time' ? 'time' : 'distance');
+
+    const url = `https://wps.hereapi.com/v8/findsequence2?${params.toString()}`;
+    const r = await fetch(url);
+    const j = await r.json();
+    res.json(j);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// Truck routing proxy
+// Expected payload: { origin:{lat,lng}, destination:{lat,lng}, vias:[{lat,lng}], truck:{height,width,length,weight} }
+app.post('/route', async (req, res) => {
+  try {
+    const { origin, destination, vias = [], truck = {} } = req.body || {};
+    const url = new URL('https://router.hereapi.com/v8/routes');
+    url.searchParams.set('apiKey', HERE_API_KEY);
+    url.searchParams.set('transportMode', 'truck');
+    url.searchParams.set('return', 'polyline,summary,notices');
+
+    const body = {
+      origin,
+      destination,
+      via: vias.map(v => ({ latLng: v })),
+      routingMode: 'fast',
+      truck: {
+        height: truck.height, width: truck.width, length: truck.length,
+        weight: truck.weight
+      }
+    };
+
+    const r = await fetch(url.toString(), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const j = await r.json();
+    res.json(j);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`MVP proxy up on :${PORT}`));
+</script>
+
+
+<!-- =============================
+= 3) .env (example)
+============================== -->
+<script type="text/plain" data-filename=".env">
+HERE_API_KEY=YOUR_HERE_API_KEY
+PORT=3000
+</script>
+
+
+<!-- =============================
+= 4) README (schema + flow)
+============================== -->
+<script type="text/plain" data-filename="README.md">
+# MVP Route Creator
+
+## CSV Schema (minimum)
+| column | required | notes |
+|---|---|---|
+| id | yes | unique per row |
+| role | yes | `depot_start`, `stop`, or `depot_end` |
+| treatment | yes | e.g., R05, R12 |
+| lat | yes | decimal |
+| lon | yes | decimal |
+| demand_weight | no | numeric (kg) |
+| demand_volume | no | numeric (m^3) |
+| service_minutes | no | per-stop service time |
+
+## Flow
+1. Upload CSV.
+2. App groups rows by `treatment`.
+3. For each treatment: picks first `depot_start` and first `depot_end` as depots.
+4. Partitions `stop` rows by constraints (greedy by `maxStops`, `capWeight`, `capVol`).
+5. For each batch:
+   - Calls `/wps` to sequence (start → stops → end).
+   - Calls `/route` with ordered coordinates to get truck-legal polyline.
+   - Renders polyline and numbered markers.
+6. If `maxMinutes` is set, you can post-filter results by the returned summary and flag overages.
+
+## Run locally
+```
+# terminal 1 (proxy)
+npm init -y
+npm i express node-fetch dotenv
+node server.js
+
+# terminal 2 (static)
+# serve index.html using any static server (e.g., VS Code Live Server)
+```
+
+## Notes on splitting
+This MVP does a simple greedy partition pre-WPS. It is fast and transparent. For better geographic efficiency, we can replace it with:
+- Sweep (angle-based) + capacity binning
+- K-means on coordinates → then apply capacity rules per cluster
+- HERE Fleet Telematics VRP (paid) if needed later
+
+</script>
