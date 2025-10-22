@@ -76,18 +76,15 @@ export async function sequenceWaypoints(
   const params = new URLSearchParams();
   
   // Start at Cochera
-  params.append('start', `s;${cocheraLat},${cocheraLon}`);
+  params.append('start', `cochera;${cocheraLat},${cocheraLon}`);
   
-  // Add all waypoints as destinations
+  // Add all customer waypoints
   waypoints.forEach((wp, idx) => {
-    params.append(`w${idx}`, `${wp.id};${wp.lat},${wp.lon}`);
+    params.append(`destination${idx + 1}`, `${wp.id};${wp.lat},${wp.lon}`);
   });
   
-  // Add Planta as destination before returning
-  params.append(`w${waypoints.length}`, `planta;${plantaLat},${plantaLon}`);
-  
-  // End back at Cochera
-  params.append('end', `e;${cocheraLat},${cocheraLon}`);
+  // End at Planta (WPS will sequence from Cochera to Planta)
+  params.append('end', `planta;${plantaLat},${plantaLon}`);
   
   params.append('improveFor', 'time');
   params.append('mode', 'fastest;truck;traffic:enabled');
@@ -113,19 +110,16 @@ export async function sequenceWaypoints(
     }
     
     const data = await response.json();
-    console.log('[WPS] Response data:', JSON.stringify(data).substring(0, 500));
-    
     const sequence = data.results?.[0]?.waypoints || [];
-    console.log('[WPS] Found', sequence.length, 'waypoints in sequence');
+    console.log('[WPS] Sequenced', sequence.length, 'waypoints from Cochera to Planta');
     
     const sequenced: SequencedWaypoint[] = [];
     
     let sequenceIndex = 0;
     for (let i = 0; i < sequence.length; i++) {
       const seqWp = sequence[i];
-      console.log(`[WPS] Waypoint ${i}: id=${seqWp.id}`);
-      // Skip start, end, and planta - they're not customer stops
-      if (seqWp.id === 's' || seqWp.id === 'e' || seqWp.id === 'planta') continue;
+      // Skip cochera and planta - they're not customer stops
+      if (seqWp.id === 'cochera' || seqWp.id === 'planta') continue;
       
       const originalWp = waypoints.find(w => w.id === seqWp.id);
       if (originalWp) {
@@ -139,6 +133,7 @@ export async function sequenceWaypoints(
       }
     }
     
+    console.log('[WPS] Returning', sequenced.length, 'customer stops in sequence');
     return sequenced;
   } catch (error) {
     console.error('Waypoint sequencing error:', error);
@@ -167,19 +162,21 @@ export async function getTruckRoute(
   params.append('transportMode', 'truck');
   params.append('routingMode', 'fast');
   
-  // Start at Cochera
+  // Route structure: Cochera → Stops → Planta → Cochera
+  
+  // 1. Start at Cochera
   params.append('origin', `${cocheraLat},${cocheraLon}`);
   
-  // Add all customer stops in sequence
+  // 2. Add all customer stops in WPS-optimized sequence
   const sorted = [...waypoints].sort((a, b) => a.sequenceIndex - b.sequenceIndex);
   sorted.forEach(wp => {
     params.append('via', `${wp.lat},${wp.lon}`);
   });
   
-  // Go to Planta
+  // 3. Go to Planta
   params.append('via', `${plantaLat},${plantaLon}`);
   
-  // Return to Cochera
+  // 4. Return to Cochera
   params.append('destination', `${cocheraLat},${cocheraLon}`);
   
   // Format: YYYY-MM-DDTHH:MM:SS+00:00 (Remove milliseconds for consistency)
